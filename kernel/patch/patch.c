@@ -54,6 +54,7 @@ void module_init();
 void syscall_init();
 int kstorage_init();
 int su_compat_init();
+// int selinux_hide_init();
 
 #ifdef ANDROID
 int android_user_init();
@@ -89,6 +90,9 @@ static void before_rest_init(hook_fargs4_t *args, void *udata)
     rc = su_compat_init();
     log_boot("su_compat_init done: %d\n", rc);
 
+    // rc = selinux_hide_init();
+    // log_boot("selinux_hide_init done: %d\n", rc);
+
     rc = resolve_pt_regs();
     log_boot("resolve_pt_regs done: %d\n", rc);
 
@@ -119,11 +123,18 @@ static int extra_event_load_kpm(const patch_extra_item_t *extra, const char *arg
     return 0;
 }
 
-void extra_event_init(const char *event)
+void extra_event_init_args(const char *event, const char *args)
 {
     if (!event) return;
     log_boot("event: %s\n", event);
+    notify_modules_event(event, args, 0);
     on_each_extra_item(extra_event_load_kpm, (void *)event);
+}
+KP_EXPORT_SYMBOL(extra_event_init_args);
+
+void extra_event_init(const char *event)
+{
+    extra_event_init_args(event, 0);
 }
 KP_EXPORT_SYMBOL(extra_event_init);
 

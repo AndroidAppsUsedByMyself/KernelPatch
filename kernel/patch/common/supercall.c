@@ -109,11 +109,13 @@ static long call_kpm_nums()
 static long call_kpm_list(char *__user names, int len)
 {
     if (len <= 0) return -EINVAL;
-    char buf[4096];
+    char buf[4096] = { 0 };
     int sz = list_modules(buf, sizeof(buf));
+    if (sz < 0) return sz;
     if (sz > len) return -ENOBUFS;
-    sz = compat_copy_to_user(names, buf, len);
-    return sz;
+    int copy_len = sz > 0 ? sz : 1;
+    int rc = compat_copy_to_user(names, buf, copy_len);
+    return rc == copy_len ? sz : -EFAULT;
 }
 
 static long call_kpm_info(const char *__user uname, char *__user out_info, int out_len)
@@ -324,6 +326,9 @@ static long supercall(int is_authed, long cmd, long arg1, long arg2, long arg3, 
         return call_list_kstorage_ids((int)arg1, (long *)arg2, (int)arg3);
     case SUPERCALL_KSTORAGE_REMOVE:
         return call_kstorage_remove((int)arg1, (long)arg2);
+
+    case SUPERCALL_CONTROL_FEATURE:
+        return kp_control_feature_sc((const char __user *)arg1, (int)(long)arg2);
 
 #ifdef ANDROID
     case SUPERCALL_SU_GET_SAFEMODE:

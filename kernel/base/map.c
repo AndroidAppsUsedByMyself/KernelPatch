@@ -51,7 +51,18 @@ static uint64_t map_phys_alloc(map_data_t *data, uint64_t size, uint64_t align)
 {
     if (data->map_symbol.memblock_phys_alloc_type == MAP_SYM_MEMBLOCK_PHYS_ALLOC_TRY_NID ||
         data->map_symbol.memblock_phys_alloc_type == MAP_SYM_MEMBLOCK_ALLOC_TRY_NID) {
-        return ((memblock_phys_alloc_try_nid_f)data->map_symbol.memblock_phys_alloc_relo)(size, align, NUMA_NO_NODE);
+        /*
+         * memblock_phys_alloc_try_nid(size, align, nid): 3rd arg is the NUMA node.
+         * memblock_alloc_try_nid(size, align, min_addr, max_addr, nid): 3rd arg is min_addr.
+         * On old kernels (4.x) that lack memblock_phys_alloc_try_nid, the patcher falls back
+         * to the 5-arg memblock_alloc_try_nid. Passing NUMA_NO_NODE(-1) there makes min_addr
+         * 0xffffffffffffffff so the allocation always fails (start > end) and start_pa = 0,
+         * which corrupts memory at PA 0 and prevents boot. Use 0 (= nid 0 / min_addr 0).
+         */
+        int third_arg = (data->map_symbol.memblock_phys_alloc_type == MAP_SYM_MEMBLOCK_PHYS_ALLOC_TRY_NID)
+                            ? NUMA_NO_NODE
+                            : 0;
+        return ((memblock_phys_alloc_try_nid_f)data->map_symbol.memblock_phys_alloc_relo)(size, align, third_arg);
     }
 
     return 0;
@@ -75,9 +86,25 @@ static void flush_icache_all(void)
     asm volatile("isb" : : : "memory");
 }
 
+// The map region is copied to a different kernel address at boot, so it must be
+// self-contained: no `bl` may leave the region. GCC 14 lowers the 0xa0-byte
+// struct copy `*data = *get_data()` to a memcpy() call; that bl targets the
+// kpimg's own memcpy (fixed kpimg offset) and misrelocates once the map code is
+// copied into the kernel, jumping into unrelated kernel text (e.g. tcp_done).
+// Copy explicitly with a volatile byte loop so no memcpy call is emitted.
+static __noinline void copy_map_data(map_data_t *dst)
+{
+    const map_data_t *src = get_data();
+    volatile unsigned char *d = (volatile unsigned char *)dst;
+    const volatile unsigned char *s = (const volatile unsigned char *)src;
+    for (unsigned int i = 0; i < sizeof(map_data_t); i++) {
+        d[i] = s[i];
+    }
+}
+
 static __noinline void mem_proc(map_data_t *data)
 {
-	*data = *get_data();
+    copy_map_data(data);
     uint64_t kernel_va = get_kva();
 
     // relocation
