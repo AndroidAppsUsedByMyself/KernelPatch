@@ -467,8 +467,8 @@ static void _linux_fs_sym_match(const char *name, unsigned long addr)
     // kfunc_match(dentry_open, name, addr);
     kfunc_match(filp_close, name, addr);
     // kfunc_match(getname, name, addr);
-    // kfunc_match(getname_kernel, name, addr);
-    // kfunc_match(putname, name, addr);
+    kfunc_match(getname_kernel, name, addr);
+    kfunc_match(putname, name, addr);
     // kfunc_match(final_putname, name, addr);
     kfunc_match(vfs_llseek, name, addr);
     kfunc_match(iterate_dir, name, addr);
@@ -595,7 +595,7 @@ static void _linux_security_selinux_sym_match(const char *name, unsigned long ad
 {
     // kvar_match(selinux_enabled_boot, name, addr);
     // kvar_match(selinux_enabled, name, addr);
-    // kvar_match(selinux_state, name, addr);
+    kvar_match(selinux_state, name, addr);
     // kvar_match(secclass_map, name, addr);
     // kfunc_match(security_mls_enabled, name, addr);
     // kfunc_match(security_load_policy, name, addr);

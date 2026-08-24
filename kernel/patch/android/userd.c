@@ -41,6 +41,7 @@
 #include <linux/errno.h>
 #include <log.h>
 #include <common.h>
+#include <module.h>
 
 #define REPLACE_RC_FILE "/dev/user_init.rc"
 
@@ -49,19 +50,23 @@
 #define DEV_LOG_DIR "/dev/user_init_log/"
 #define AP_BIN_DIR AP_DIR "bin/"
 #define AP_LOG_DIR AP_DIR "log/"
-#define AP_MAGISKPOLICY_PATH AP_BIN_DIR "magiskpolicy"
 #define MAGISK_SCTX "u:r:magisk:s0"
 #define APD_PATH "/data/adb/apd"
-#define MAGISK_POLICY_PATH "/data/adb/ap/bin/magiskpolicy"
 #define AP_PACKAGE_CONFIG_PATH "/data/adb/ap/package_config"
 #define ANDROID_PACKAGES_LIST_PATH "/data/system/packages.list"
 #define ANDROID_PACKAGES_LIST_TMP_PATH "/data/system/packages.list.tmp"
-#define ANDROID_PACKAGES_XML_PATH "/data/system/packages.xml"
+#define AP_KPM_DIR AP_DIR "kpm/"
+#define AP_KPM_NAME_LEN 128
+#define AP_KPM_MAX_MODULES 256
+
+extern int android_is_safe_mode;
+
 #define APK_SIG_BLOCK_MAGIC "APK Sig Block 42"
 #define APK_SIG_BLOCK_MAGIC_LEN 16
 #define APK_SIG_SCHEME_V2_BLOCK_ID 0x7109871au
 #define APK_SIG_SCHEME_V3_BLOCK_ID 0xf05368c0u
 #define APK_SIG_SCHEME_V31_BLOCK_ID 0x1b93ad61u
+
 #define APK_CERT_MAX_LENGTH 4096
 
 #define TRUSTED_MANAGER_DIGEST_LEN SHA256_BLOCK_SIZE
@@ -123,7 +128,6 @@ static const char user_rc_data[] = { //
     "on late-init\n"
     "    exec -- " SUPERCMD " %s event late-init before\n"
     "on post-fs-data\n"
-    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " MAGISK_POLICY_PATH " --magisk --live\n"
     "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " -s %s post-fs-data\n"
     "on nonencrypted\n"
     "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " -s %s services\n"
@@ -137,6 +141,44 @@ static const char user_rc_data[] = { //
     "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " -c \"mv -f " DEV_LOG_DIR " " AP_LOG_DIR "\"\n"
     ""
 };
+
+/* Expand every %s in an rc template with the same string.  This deliberately
+ * supports only %s and %%: user_rc_data is a template, not a general printf
+ * format string, and keeping the parser small makes the output bound explicit. */
+static int expand_rc_template(char *dst, size_t dst_size, const char *template, const char *value)
+{
+    size_t out = 0;
+    size_t value_len;
+
+    if (!dst || !dst_size || !template || !value) return -EINVAL;
+    value_len = strlen(value);
+
+    while (*template) {
+        const char *src = template;
+        size_t len = 1;
+
+        if (*template == '%') {
+            if (template[1] == 's') {
+                src = value;
+                len = value_len;
+                template += 2;
+            } else if (template[1] == '%') {
+                template += 2;
+            } else {
+                return -EINVAL;
+            }
+        } else {
+            template++;
+        }
+
+        if (len >= dst_size - out) return -E2BIG;
+        memcpy(dst + out, src, len);
+        out += len;
+    }
+
+    dst[out] = '\0';
+    return (int)out;
+}
 
 static const void *kernel_read_file(const char *path, loff_t *len)
 {
@@ -181,19 +223,36 @@ static int is_packages_list_tmp_dentry_path(const char *path)
     return path_has_suffix(path, "/system/packages.list.tmp");
 }
 
-static int read_le32(struct file *fp, loff_t *pos, uint32_t *out)
+/* bounds-checked read: fails if [*pos, *pos+size) would fall outside [*pos, end) */
+static int read_exact(struct file *fp, void *buf, size_t size, loff_t *pos, loff_t end)
 {
-    return kernel_read(fp, out, sizeof(*out), pos) == sizeof(*out) ? 0 : -EIO;
+    if (*pos < 0 || *pos > end || size > (size_t)(end - *pos)) return -EINVAL;
+    return kernel_read(fp, buf, size, pos) == (ssize_t)size ? 0 : -EIO;
 }
 
-static int read_le64(struct file *fp, loff_t *pos, uint64_t *out)
+static int read_le32_bounded(struct file *fp, loff_t *pos, loff_t end, uint32_t *out)
 {
-    return kernel_read(fp, out, sizeof(*out), pos) == sizeof(*out) ? 0 : -EIO;
+    return read_exact(fp, out, sizeof(*out), pos, end);
 }
 
-static int skip_bytes(loff_t *pos, uint64_t len)
+static int read_le64_bounded(struct file *fp, loff_t *pos, loff_t end, uint64_t *out)
 {
-    *pos += (loff_t)len;
+    return read_exact(fp, out, sizeof(*out), pos, end);
+}
+
+static int read_le16_bounded(struct file *fp, loff_t *pos, loff_t end, uint16_t *out)
+{
+    return read_exact(fp, out, sizeof(*out), pos, end);
+}
+
+/* reads a u32 length prefix at *pos and returns the end of the length-prefixed
+ * field, bounded by container_end so a forged length can't escape its parent */
+static int read_length_prefixed_end(struct file *fp, loff_t *pos, loff_t container_end, loff_t *value_end)
+{
+    uint32_t length;
+    if (read_le32_bounded(fp, pos, container_end, &length)) return -EINVAL;
+    if ((uint64_t)length > (uint64_t)(container_end - *pos)) return -EINVAL;
+    *value_end = *pos + (loff_t)length;
     return 0;
 }
 
@@ -211,55 +270,43 @@ static int cert_der_matches_trusted_digest(const uint8_t *cert_der, size_t cert_
     return lib_memcmp(digest, expected_digest, TRUSTED_MANAGER_DIGEST_LEN) == 0 ? 0 : -EPERM;
 }
 
-struct zip_entry_header
+static int apk_sig_block_matches_trusted_digest(struct file *fp, loff_t *pos, loff_t block_end,
+                                                const uint8_t *expected_digest)
 {
-    uint32_t signature;
-    uint16_t version;
-    uint16_t flags;
-    uint16_t compression;
-    uint16_t mod_time;
-    uint16_t mod_date;
-    uint32_t crc32;
-    uint32_t compressed_size;
-    uint32_t uncompressed_size;
-    uint16_t file_name_length;
-    uint16_t extra_field_length;
-} __attribute__((packed));
-
-static int apk_sig_block_matches_trusted_digest(struct file *fp, uint32_t *size4, loff_t *pos, uint32_t *offset, const uint8_t *expected_digest)
-{
+    loff_t signers_end, signer_end, signed_data_end, digests_end, certificates_end;
+    uint32_t cert_len;
     uint8_t *cert_buf;
 
-    if (read_le32(fp, pos, size4)) return 0; // signer-sequence length
-    if (read_le32(fp, pos, size4)) return 0; // signer length
-    if (read_le32(fp, pos, size4)) return 0; // signed data length
-    *offset += sizeof(*size4) * 3;
-
-    if (read_le32(fp, pos, size4)) return 0; // digests-sequence length
-    if (skip_bytes(pos, *size4)) return 0;
-    *offset += sizeof(*size4) + *size4;
-
-    if (read_le32(fp, pos, size4)) return 0; // certificates length
-    if (read_le32(fp, pos, size4)) return 0; // certificate length
-    *offset += sizeof(*size4) * 2;
-
-    if (*size4 == 0 || *size4 > APK_CERT_MAX_LENGTH) {
-        log_boot("trusted manager apk cert length invalid: %u\n", *size4);
+    // v2 block: signers sequence -> first signer -> signed data -> digests
+    if (read_length_prefixed_end(fp, pos, block_end, &signers_end) ||
+        read_length_prefixed_end(fp, pos, signers_end, &signer_end) ||
+        read_length_prefixed_end(fp, pos, signer_end, &signed_data_end) ||
+        read_length_prefixed_end(fp, pos, signed_data_end, &digests_end)) {
         return 0;
     }
 
-    *offset += *size4;
-    cert_buf = vmalloc(*size4);
+    *pos = digests_end;
+    if (read_length_prefixed_end(fp, pos, signed_data_end, &certificates_end) ||
+        read_le32_bounded(fp, pos, certificates_end, &cert_len)) {
+        return 0;
+    }
+
+    if (cert_len == 0 || cert_len > APK_CERT_MAX_LENGTH || (uint64_t)cert_len > (uint64_t)(certificates_end - *pos)) {
+        log_boot("trusted manager apk cert length invalid: %u\n", cert_len);
+        return 0;
+    }
+
+    cert_buf = vmalloc(cert_len);
     if (!cert_buf) {
         return 0;
     }
 
-    if (kernel_read(fp, cert_buf, *size4, pos) != *size4) {
+    if (read_exact(fp, cert_buf, cert_len, pos, certificates_end)) {
         kvfree(cert_buf);
         return 0;
     }
 
-    if (!cert_der_matches_trusted_digest(cert_buf, *size4, expected_digest)) {
+    if (!cert_der_matches_trusted_digest(cert_buf, cert_len, expected_digest)) {
         kvfree(cert_buf);
         return 2;
     }
@@ -268,35 +315,46 @@ static int apk_sig_block_matches_trusted_digest(struct file *fp, uint32_t *size4
     return 1;
 }
 
-static int apk_has_v1_signature_file(struct file *fp)
+/* v1 (JAR) signing leaves META-INF/ RSA, DSA, or EC signature block entries
+ * in the ZIP central directory; detect them without parsing the PKCS7 payload. */
+static int apk_has_v1_signature(struct file *fp, loff_t cd_start, loff_t cd_end)
 {
-    static const char manifest[] = "META-INF/MANIFEST.MF";
-    struct zip_entry_header header;
-    loff_t pos = 0;
+    loff_t pos = cd_start;
 
-    while (kernel_read(fp, &header, sizeof(header), &pos) == sizeof(header)) {
-        if (header.signature != 0x04034b50u) {
-            return 0;
+    while (pos < cd_end) {
+        uint32_t sig;
+        uint16_t name_len, extra_len, comment_len;
+        char name[72];
+        loff_t entry_start = pos;
+        loff_t name_pos;
+
+        if (read_le32_bounded(fp, &pos, cd_end, &sig) || sig != 0x02014b50u) {
+            break;
         }
 
-        if (header.file_name_length == sizeof(manifest) - 1) {
-            char file_name[sizeof(manifest)];
-            if (kernel_read(fp, file_name, header.file_name_length, &pos) != header.file_name_length) {
-                return 0;
+        pos = entry_start + 28;
+        if (read_le16_bounded(fp, &pos, cd_end, &name_len) ||
+            read_le16_bounded(fp, &pos, cd_end, &extra_len) ||
+            read_le16_bounded(fp, &pos, cd_end, &comment_len)) {
+            break;
+        }
+        if (entry_start + 46 + name_len + extra_len + comment_len > cd_end) {
+            break;
+        }
+
+        if (name_len > 0 && name_len < sizeof(name)) {
+            name_pos = entry_start + 46;
+            if (!read_exact(fp, name, name_len, &name_pos, cd_end)) {
+                name[name_len] = '\0';
+                if (!strncmp(name, "META-INF/", 9) &&
+                    (path_has_suffix(name, ".RSA") || path_has_suffix(name, ".DSA") || path_has_suffix(name, ".EC"))) {
+                    return 1;
+                }
             }
-            file_name[header.file_name_length] = '\0';
-            if (strncmp(file_name, manifest, sizeof(manifest) - 1) == 0) {
-                return 1;
-            }
-        } else if (skip_bytes(&pos, header.file_name_length)) {
-            return 0;
         }
 
-        if (skip_bytes(&pos, (uint64_t)header.extra_field_length + header.compressed_size)) {
-            return 0;
-        }
+        pos = entry_start + 46 + name_len + extra_len + comment_len;
     }
-
     return 0;
 }
 
@@ -306,13 +364,21 @@ static int apk_matches_trusted_signature(const char *path, const uint8_t *expect
     int rc = 0;
     int v2_blocks = 0;
     int v2_valid = 0;
-    int v3_present = 0;
-    int v31_present = 0;
+    int v3_blocks = 0;
+    int v3_valid = 0;
+    int v31_blocks = 0;
+    int v31_valid = 0;
     uint8_t magic[APK_SIG_BLOCK_MAGIC_LEN + 1] = { 0 };
-    uint32_t size4;
-    uint64_t size8;
+    uint32_t cd_offset = 0;
+    uint32_t cd_size = 0;
+    uint32_t zip64_locator_magic;
+    uint32_t eocd_sig;
     uint64_t size_of_block;
+    uint64_t size_of_block_at_head;
     loff_t pos;
+    loff_t file_size;
+    loff_t eocd_offset = -1;
+    loff_t pairs_end;
     struct file *fp;
 
     if (!path || !path[0]) return 0;
@@ -325,97 +391,146 @@ static int apk_matches_trusted_signature(const char *path, const uint8_t *expect
         return 0;
     }
 
+    file_size = vfs_llseek(fp, 0, SEEK_END);
+    if (file_size < 0) {
+        goto out;
+    }
+
+    // https://en.wikipedia.org/wiki/Zip_(file_format)#End_of_central_directory_record_(EOCD)
     for (i = 0; i <= 0xffff; i++) {
         unsigned short n = 0;
-        pos = vfs_llseek(fp, -i - 2, SEEK_END);
-        if (pos < 0) {
-            continue;
-        }
-        if (kernel_read(fp, &n, sizeof(n), &pos) != sizeof(n)) {
+        pos = file_size - i - 2;
+        if (read_exact(fp, &n, sizeof(n), &pos, file_size)) {
             continue;
         }
         if (n == i) {
             pos -= 22;
-            if (!read_le32(fp, &pos, &size4) && size4 == 0x06054b50u) {
+            if (!read_le32_bounded(fp, &pos, file_size, &eocd_sig) && eocd_sig == 0x06054b50u) {
+                eocd_offset = pos - sizeof(eocd_sig);
                 break;
             }
         }
     }
 
-    if (i > 0xffff) {
+    if (i > 0xffff || eocd_offset < 0) {
         goto out;
     }
 
-    pos += 12;
-    if (read_le32(fp, &pos, &size4)) {
-        goto out;
+    // ZIP64 keeps the real central-directory offset in a separate locator;
+    // reject it so the (32-bit) offsets read below can't be spoofed
+    if (eocd_offset >= 20) {
+        pos = eocd_offset - 20;
+        if (read_le32_bounded(fp, &pos, file_size, &zip64_locator_magic)) {
+            goto out;
+        }
+        if (zip64_locator_magic == 0x07064b50u) {
+            goto out;
+        }
     }
-    pos = (loff_t)size4 - 0x18;
 
-    if (read_le64(fp, &pos, &size8)) {
+    pos = eocd_offset + 12;
+    if (read_le32_bounded(fp, &pos, file_size, &cd_size)) {
         goto out;
     }
-    if (kernel_read(fp, magic, APK_SIG_BLOCK_MAGIC_LEN, &pos) != APK_SIG_BLOCK_MAGIC_LEN) {
+    if (read_le32_bounded(fp, &pos, file_size, &cd_offset)) {
+        goto out;
+    }
+    if ((uint64_t)cd_offset > (uint64_t)eocd_offset || (uint64_t)cd_size != (uint64_t)eocd_offset - cd_offset) {
+        goto out;
+    }
+    if (cd_offset < 0x20) {
+        goto out;
+    }
+
+    pairs_end = (loff_t)cd_offset - 0x18;
+    pos = pairs_end;
+
+    if (read_le64_bounded(fp, &pos, (loff_t)cd_offset, &size_of_block)) {
+        goto out;
+    }
+    if (read_exact(fp, magic, APK_SIG_BLOCK_MAGIC_LEN, &pos, (loff_t)cd_offset)) {
         goto out;
     }
     if (strncmp((char *)magic, APK_SIG_BLOCK_MAGIC, APK_SIG_BLOCK_MAGIC_LEN) != 0) {
         goto out;
     }
 
-    pos = (loff_t)size4 - (loff_t)(size8 + 0x8);
-    if (read_le64(fp, &pos, &size_of_block)) {
-        goto out;
-    }
-    if (size_of_block != size8) {
+    if (size_of_block < 0x18 || size_of_block > (uint64_t)cd_offset - 0x8) {
         goto out;
     }
 
-    for (i = 0; i < 16; i++) {
+    pos = (loff_t)cd_offset - (loff_t)size_of_block - 0x8;
+    if (read_le64_bounded(fp, &pos, pairs_end, &size_of_block_at_head)) {
+        goto out;
+    }
+    if (size_of_block_at_head != size_of_block) {
+        goto out;
+    }
+
+    // scan every length-prefixed pair up to pairs_end; malformed lengths fail
+    // the bounds check below instead of relying on an iteration cap
+    while (pos < pairs_end) {
         uint32_t id;
-        uint32_t offset = sizeof(id);
-        if (read_le64(fp, &pos, &size8)) {
+        uint64_t size_of_pair;
+        loff_t pair_end;
+
+        if (read_le64_bounded(fp, &pos, pairs_end, &size_of_pair)) {
             goto out;
         }
-        if (size8 == size_of_block) {
-            break;
+        if (size_of_pair < sizeof(id) || size_of_pair > (uint64_t)(pairs_end - pos)) {
+            goto out;
         }
-        if (read_le32(fp, &pos, &id)) {
+        pair_end = pos + (loff_t)size_of_pair;
+        if (read_le32_bounded(fp, &pos, pair_end, &id)) {
             goto out;
         }
 
         if (id == APK_SIG_SCHEME_V2_BLOCK_ID) {
             int match;
             v2_blocks++;
-            match = apk_sig_block_matches_trusted_digest(fp, &size4, &pos, &offset, expected_digest);
+            match = apk_sig_block_matches_trusted_digest(fp, &pos, pair_end, expected_digest);
             if (match == 2) {
                 v2_valid = 1;
             }
         } else if (id == APK_SIG_SCHEME_V3_BLOCK_ID) {
-            v3_present = 1;
+            int match;
+            v3_blocks++;
+            // v3's "signed data" starts with digests then certificates, same
+            // layout as v2, so the same bounded parser applies here.
+            match = apk_sig_block_matches_trusted_digest(fp, &pos, pair_end, expected_digest);
+            if (match == 2) {
+                v3_valid = 1;
+            }
         } else if (id == APK_SIG_SCHEME_V31_BLOCK_ID) {
-            v31_present = 1;
+            int match;
+            v31_blocks++;
+            match = apk_sig_block_matches_trusted_digest(fp, &pos, pair_end, expected_digest);
+            if (match == 2) {
+                v31_valid = 1;
+            }
         }
 
-        if (size8 < offset) {
-            log_boot("trusted manager apk sig block size invalid: %llu offset: %u\n", size8, offset);
-            goto out;
-        }
-        if (skip_bytes(&pos, size8 - offset)) {
-            log_boot("trusted manager apk sig block skip failed\n");
-            goto out;
-        }
+        pos = pair_end;
     }
 
-    if (!v2_valid) {
-        log_boot("trusted manager apk sig block invalid: v2_blocks=%d v2_valid=%d v3_present=%d v31_present=%d\n",
-                 v2_blocks, v2_valid, v3_present, v31_present);
+
+    // only a lone, valid v2 signature is trusted; v1/v3/v3.1 verification
+    // parsing above is kept for diagnostics but does not grant trust
+    if (apk_has_v1_signature(fp, (loff_t)cd_offset, eocd_offset)) {
+        log_boot("trusted manager apk unexpected v1 (JAR) signature scheme\n");
         goto out;
     }
 
-    // if (apk_has_v1_signature_file(fp)) {
-    //     log_boot("trusted manager apk has v1 signature file, which is not allowed\n");
-    //     goto out;
-    // }
+    if (v3_blocks || v31_blocks) {
+        log_boot("trusted manager apk unexpected v3/v3.1 signature scheme alongside v2\n");
+        goto out;
+    }
+
+    if (!v2_valid) {
+        log_boot("trusted manager apk sig invalid: v2=%d/%d v3=%d/%d v31=%d/%d\n",
+                 v2_valid, v2_blocks, v3_valid, v3_blocks, v31_valid, v31_blocks);
+        goto out;
+    }
 
     rc = 1;
 
@@ -597,6 +712,7 @@ static int apk_inner_actor_int(struct dir_context_int *dctx,
     size_t len, outer_len, path_len;
     static const char base_apk[] = "/base.apk";
 
+    /* Old-kernel actor contract: return 0 to keep iterating, non-zero to stop. */
     if (!ctx || !ctx->result)
         return 1;
 
@@ -644,6 +760,13 @@ struct apk_outer_ctx {
     char *inner_path; /* heap-allocated: "/data/app/~~<hash>/" */
     size_t inner_path_len;
     const char *package;
+    /* Phase-1 collection: "~~" subdir names recorded while iterating (no file
+     * opens happen inside the iterate — that would re-take the directory lock
+     * and deadlock on 4.x).  names is a flat vmalloc array, name_len per slot. */
+    char *names;
+    int name_count;
+    int max_names;
+    int name_len;
 };
 
 struct apk_outer_ctx_int {
@@ -654,16 +777,25 @@ struct apk_outer_ctx_int {
     char *inner_path; /* heap-allocated: "/data/app/~~<hash>/" */
     size_t inner_path_len;
     const char *package;
+    /* Phase-1 collection, see apk_outer_ctx. */
+    char *names;
+    int name_count;
+    int max_names;
+    int name_len;
 };
 
+/*
+ * Outer callback (phase 1): scan /data/app/ once.  Match the flat layout
+ * directly, otherwise RECORD "~~" scramble subdir names.  No filp_open happens
+ * here: the outer iterate holds the directory inode lock on 4.x and opening a
+ * child re-takes it -> self-deadlock.  The inner dirs are descended afterwards,
+ * in find_trusted_manager_apk_path, once the iterate has released the lock.
+ */
 static bool apk_outer_actor(struct dir_context *dctx,
                             const char *name, int namelen,
                             loff_t offset, u64 ino, unsigned int d_type)
 {
     struct apk_outer_ctx *ctx = container_of(dctx, struct apk_outer_ctx, dctx);
-    struct apk_inner_ctx *inner;
-    struct file *inner_dir;
-    int len;
 
     if (!ctx)
         return false;
@@ -671,42 +803,34 @@ static bool apk_outer_actor(struct dir_context *dctx,
     if (ctx->found)
         return false;
 
-    if (namelen < 2 || name[0] != '~' || name[1] != '~')
-        return true;
-
-    len = snprintf(ctx->inner_path, ctx->inner_path_len,
-                   "/data/app/%.*s/", namelen, name);
-    if (len <= 0 || len >= (int)ctx->inner_path_len)
-        return true;
-
-    inner_dir = filp_open(ctx->inner_path, O_RDONLY | O_NOFOLLOW, 0);
-    if (IS_ERR(inner_dir))
-        return true;
-
-    inner = vmalloc(sizeof(*inner));
-    if (!inner) {
-        filp_close(inner_dir, 0);
-        return true;
-    }
-    memset(inner, 0, sizeof(*inner));
-
-    inner->dctx.actor = apk_inner_actor;
-    inner->dctx.pos = 0;
-    inner->outer_dir = ctx->inner_path;
-    inner->result = ctx->result;
-    inner->result_len = ctx->result_len;
-    inner->package = ctx->package;
-
-    iterate_dir(inner_dir, &inner->dctx);
-    filp_close(inner_dir, 0);
-
-    if (inner->found) {
-        ctx->found = 1;
-        vfree(inner);
-        return false;
+    /* flat layout: /data/app/<pkg>-<n>/base.apk (pre-Android-11). */
+    {
+        const char *pkg = ctx->package;
+        size_t plen = strnlen(pkg, 128);
+        if (namelen > (int)plen && !memcmp(name, pkg, plen) && name[plen] == '-') {
+            static const char outer_dir[] = "/data/app/";
+            static const char base_apk[] = "/base.apk";
+            size_t olen = sizeof(outer_dir) - 1;
+            size_t blen = sizeof(base_apk);
+            if (olen + (size_t)namelen + blen < ctx->result_len) {
+                memcpy(ctx->result, outer_dir, olen);
+                memcpy(ctx->result + olen, name, namelen);
+                memcpy(ctx->result + olen + namelen, base_apk, blen);
+                ctx->found = 1;
+                return false;
+            }
+            return true;
+        }
     }
 
-    vfree(inner);
+    if (namelen >= 2 && name[0] == '~' && name[1] == '~') {
+        if (ctx->name_count < ctx->max_names && namelen < ctx->name_len) {
+            char *slot = ctx->names + ctx->name_count * ctx->name_len;
+            memcpy(slot, name, namelen);
+            slot[namelen] = '\0';
+            ctx->name_count++;
+        }
+    }
     return true;
 }
 /* https://elixir.bootlin.com/linux/v6.0.19/source/include/linux/fs.h#L2049 */
@@ -719,51 +843,42 @@ static int apk_outer_actor_int(struct dir_context_int *dctx,
                             loff_t offset, u64 ino, unsigned int d_type)
 {
     struct apk_outer_ctx_int *ctx = container_of(dctx, struct apk_outer_ctx_int, dctx);
-    struct apk_inner_ctx_int *inner;
-    struct file *inner_dir;
-    int len;
 
+    /* Old-kernel actor contract: return 0 to keep iterating, non-zero to stop. */
     if (!ctx)
         return 1;
 
     if (ctx->found)
         return 1;
 
-    if (namelen < 2 || name[0] != '~' || name[1] != '~')
-        return 0;
-
-    len = snprintf(ctx->inner_path, ctx->inner_path_len,
-                   "/data/app/%.*s/", namelen, name);
-    if (len <= 0 || len >= (int)ctx->inner_path_len)
-        return 0;
-
-    inner_dir = filp_open(ctx->inner_path, O_RDONLY | O_NOFOLLOW, 0);
-    if (IS_ERR(inner_dir))
-        return 0;
-
-    inner = vmalloc(sizeof(*inner));
-    if (!inner) {
-        filp_close(inner_dir, 0);
-        return 0;
-    }
-    memset(inner, 0, sizeof(*inner));
-    inner->dctx.actor = apk_inner_actor_int;
-    inner->dctx.pos = 0;
-    inner->outer_dir = ctx->inner_path;
-    inner->result = ctx->result;
-    inner->result_len = ctx->result_len;
-    inner->package = ctx->package;
-
-    iterate_dir_int(inner_dir, &inner->dctx);
-    filp_close(inner_dir, 0);
-
-    if (inner->found) {
-        ctx->found = 1;
-        vfree(inner);
-        return 1;
+    /* flat layout: /data/app/<pkg>-<n>/base.apk (pre-Android-11). */
+    {
+        const char *pkg = ctx->package;
+        size_t plen = strnlen(pkg, 128);
+        if (namelen > (int)plen && !memcmp(name, pkg, plen) && name[plen] == '-') {
+            static const char outer_dir[] = "/data/app/";
+            static const char base_apk[] = "/base.apk";
+            size_t olen = sizeof(outer_dir) - 1;
+            size_t blen = sizeof(base_apk);
+            if (olen + (size_t)namelen + blen < ctx->result_len) {
+                memcpy(ctx->result, outer_dir, olen);
+                memcpy(ctx->result + olen, name, namelen);
+                memcpy(ctx->result + olen + namelen, base_apk, blen);
+                ctx->found = 1;
+                return 1;
+            }
+            return 0;
+        }
     }
 
-    vfree(inner);
+    if (namelen >= 2 && name[0] == '~' && name[1] == '~') {
+        if (ctx->name_count < ctx->max_names && namelen < ctx->name_len) {
+            char *slot = ctx->names + ctx->name_count * ctx->name_len;
+            memcpy(slot, name, namelen);
+            slot[namelen] = '\0';
+            ctx->name_count++;
+        }
+    }
     return 0;
 }
 
@@ -775,9 +890,8 @@ static int find_trusted_manager_apk_path(char *apk_path,
     log_boot("finding apk path for package: %s\n", trusted_managers[index].package);
     struct apk_outer_ctx *outer = NULL;
     struct apk_outer_ctx_int *outer_int = NULL;
-    struct apk_inner_ctx *flat = NULL;
-    struct apk_inner_ctx_int *flat_int = NULL;
     struct file *app_dir;
+    struct file *inner_dir;
     int rc = -ENOENT;
 
     char *pkg_buf = NULL;
@@ -798,31 +912,33 @@ static int find_trusted_manager_apk_path(char *apk_path,
     apk_path[0] = '\0';
 
     if (kver >= VERSION(6, 1, 0)) {
-        flat = vmalloc(sizeof(*flat));
-        if (!flat) { rc = -ENOMEM; goto out_free; }
-
         outer = vmalloc(sizeof(*outer));
         if (!outer) { rc = -ENOMEM; goto out_free; }
 
-        memset(flat, 0, sizeof(*flat));
         memset(outer, 0, sizeof(*outer));
 
         outer->inner_path = vmalloc(256);
         if (!outer->inner_path) { rc = -ENOMEM; goto out_free; }
         outer->inner_path_len = 256;
-    } else {
-        flat_int = vmalloc(sizeof(*flat_int));
-        if (!flat_int) { rc = -ENOMEM; goto out_free; }
 
+        outer->name_len = 64;
+        outer->max_names = 256;
+        outer->names = vmalloc((size_t)outer->max_names * outer->name_len);
+        if (!outer->names) { rc = -ENOMEM; goto out_free; }
+    } else {
         outer_int = vmalloc(sizeof(*outer_int));
         if (!outer_int) { rc = -ENOMEM; goto out_free; }
 
-        memset(flat_int, 0, sizeof(*flat_int));
         memset(outer_int, 0, sizeof(*outer_int));
 
         outer_int->inner_path = vmalloc(256);
         if (!outer_int->inner_path) { rc = -ENOMEM; goto out_free; }
         outer_int->inner_path_len = 256;
+
+        outer_int->name_len = 64;
+        outer_int->max_names = 256;
+        outer_int->names = vmalloc((size_t)outer_int->max_names * outer_int->name_len);
+        if (!outer_int->names) { rc = -ENOMEM; goto out_free; }
     }
 
     set_priv_sel_allow(current, true);
@@ -836,35 +952,10 @@ static int find_trusted_manager_apk_path(char *apk_path,
         goto out_free;
     }
 
-    /* ===== Pass1 ===== */
-    if (kver >= VERSION(6, 1, 0)) {
-        flat->dctx.actor = apk_inner_actor;
-        flat->dctx.pos = 0;
-        flat->outer_dir = "/data/app/";
-        flat->result = apk_path;
-        flat->result_len = apk_path_len;
-        flat->package = pkg_buf;
-
-        iterate_dir(app_dir, &flat->dctx);
-    } else {
-        flat_int->dctx.actor = apk_inner_actor_int;
-        flat_int->dctx.pos = 0;
-        flat_int->outer_dir = "/data/app/";
-        flat_int->result = apk_path;
-        flat_int->result_len = apk_path_len;
-        flat_int->package = pkg_buf;
-
-        iterate_dir_int(app_dir, &flat_int->dctx);
-    }
-
-    if ((flat && flat->found) || (flat_int && flat_int->found)) {
-        log_boot("apk found (flat): %s\n", apk_path);
-        rc = 0;
-        goto out;
-    }
-
-    /* ===== Pass2 ===== */
-    vfs_llseek(app_dir, 0, SEEK_SET);
+    /* Phase 1: iterate /data/app ONCE, collecting "~~" subdir names.  No file
+     * opens during iteration: the outer iterate holds the directory inode lock
+     * on 4.x and opening a child re-takes it (self-deadlock, seen as a boot
+     * hang).  The flat layout is matched inline (no open needed). */
     if (kver >= VERSION(6, 1, 0)) {
         outer->dctx.actor = apk_outer_actor;
         outer->dctx.pos = 0;
@@ -884,12 +975,64 @@ static int find_trusted_manager_apk_path(char *apk_path,
     }
 
     if ((outer && outer->found) || (outer_int && outer_int->found)) {
-        log_boot("apk found (scramble): %s\n", apk_path);
+        log_boot("apk found: %s\n", apk_path);
         rc = 0;
         goto out;
     }
 
-    log_boot("apk not found: %s\n", pkg_buf);
+    /* Phase 2: descend into each collected "~~" dir now that the outer iterate
+     * has released the lock. */
+    if (kver >= VERSION(6, 1, 0)) {
+        for (int i = 0; i < outer->name_count && !outer->found; i++) {
+            struct apk_inner_ctx inner = { 0 };
+            char *slot = outer->names + i * outer->name_len;
+            int plen = snprintf(outer->inner_path, outer->inner_path_len, "/data/app/%s/", slot);
+            if (plen <= 0 || plen >= (int)outer->inner_path_len) continue;
+            inner_dir = filp_open(outer->inner_path, O_RDONLY | O_NOFOLLOW, 0);
+            if (IS_ERR(inner_dir))
+                continue;
+            inner.dctx.actor = apk_inner_actor;
+            inner.dctx.pos = 0;
+            inner.outer_dir = outer->inner_path;
+            inner.result = apk_path;
+            inner.result_len = apk_path_len;
+            inner.package = pkg_buf;
+            iterate_dir(inner_dir, &inner.dctx);
+            filp_close(inner_dir, 0);
+            if (inner.found) {
+                outer->found = 1;
+                log_boot("apk found: %s\n", apk_path);
+                rc = 0;
+            }
+        }
+    } else {
+        for (int i = 0; i < outer_int->name_count && !outer_int->found; i++) {
+            struct apk_inner_ctx_int inner = { 0 };
+            char *slot = outer_int->names + i * outer_int->name_len;
+            int plen = snprintf(outer_int->inner_path, outer_int->inner_path_len, "/data/app/%s/", slot);
+            if (plen <= 0 || plen >= (int)outer_int->inner_path_len) continue;
+            inner_dir = filp_open(outer_int->inner_path, O_RDONLY | O_NOFOLLOW, 0);
+            if (IS_ERR(inner_dir))
+                continue;
+            inner.dctx.actor = apk_inner_actor_int;
+            inner.dctx.pos = 0;
+            inner.outer_dir = outer_int->inner_path;
+            inner.result = apk_path;
+            inner.result_len = apk_path_len;
+            inner.package = pkg_buf;
+            iterate_dir_int(inner_dir, &inner.dctx);
+            filp_close(inner_dir, 0);
+            if (inner.found) {
+                outer_int->found = 1;
+                log_boot("apk found: %s\n", apk_path);
+                rc = 0;
+            }
+        }
+    }
+
+    if (!((outer && outer->found) || (outer_int && outer_int->found))) {
+        log_boot("apk not found: %s\n", pkg_buf);
+    }
 
 out:
     filp_close(app_dir, 0);
@@ -897,83 +1040,19 @@ out:
 out_free:
     if (outer) {
         if (outer->inner_path) vfree(outer->inner_path);
+        if (outer->names) vfree(outer->names);
         vfree(outer);
     }
     if (outer_int) {
         if (outer_int->inner_path) vfree(outer_int->inner_path);
+        if (outer_int->names) vfree(outer_int->names);
         vfree(outer_int);
     }
-    if (flat) vfree(flat);
-    if (flat_int) vfree(flat_int);
     if (pkg_buf) vfree(pkg_buf);
     return rc;
 }
 
-static int find_apk_from_packages_xml(const char *pkg,
-                                      char *apk_path,
-                                      size_t apk_path_len)
-{
-    
-    loff_t len = 0;
-    char *data;
-    char *p;
-    int rc = -ENOENT;
 
-    data = (char *)kernel_read_file(ANDROID_PACKAGES_XML_PATH, &len);
-    if (!data || len <= 0) {
-        log_boot("read %s failed\n", ANDROID_PACKAGES_XML_PATH);
-        return -ENOENT;
-    }
-
-    log_boot("%s size: %lld bytes\n", ANDROID_PACKAGES_XML_PATH, len);
-
-    p = data;
-
-    while ((p = strstr(p, pkg))) {
-        char *start = p;
-        while (start > data && *start != '<')
-            start--;
-
-        if (strncmp(start, "<package", 8) != 0) {
-            p += strlen(pkg);
-            continue;
-        }
-        char *cp = strstr(start, "codePath=\"");
-        if (!cp) {
-            p += strlen(pkg);
-            continue;
-        }
-
-        cp += strlen("codePath=\"");
-
-        char *end = strchr(cp, '"');
-        if (!end) {
-            p += strlen(pkg);
-            continue;
-        }
-
-        size_t l = end - cp;
-
-        if (l + strlen("/base.apk") >= apk_path_len) {
-            rc = -ENOSPC;
-            goto out;
-        }
-
-        memcpy(apk_path, cp, l);
-        memcpy(apk_path + l, "/base.apk", strlen("/base.apk") + 1);
-
-        log_boot("apk found (xml): %s\n", apk_path);
-
-        rc = 0;
-        goto out;
-    }
-
-    log_boot("apk not found in %s for %s\n", ANDROID_PACKAGES_XML_PATH, pkg);
-
-out:
-    kvfree(data);
-    return rc;
-}
 
 static int refresh_trusted_manager_uid_from_packages_list(uid_t *trusted_uid_out, int use_tmp)
 {
@@ -1002,16 +1081,8 @@ static int refresh_trusted_manager_uid_from_packages_list(uid_t *trusted_uid_out
             log_boot("no apk via iterate for %s rc=%d, fallback to xml\n",
              trusted_managers[i].package, rc);
 
-            rc = find_apk_from_packages_xml(
-                    trusted_managers[i].package,
-                    apk_path,
-                    PATH_MAX);
 
-            if (rc) {
-                log_boot("no apk for %s via xml rc=%d\n",
-                        trusted_managers[i].package, rc);
-                continue;
-            }
+            continue;
         }
 
         if (!apk_matches_trusted_signature(
@@ -1331,6 +1402,131 @@ next_line:
 }
 KP_EXPORT_SYMBOL(load_ap_package_config);
 
+/*
+ * Scan /data/adb/ap/kpm without opening children from the readdir callback.
+ * Some Android kernels hold the directory inode lock while iterate_dir() is
+ * running, so child opens are deliberately deferred until after the scan.
+ * The expected layout is kpm/<module_id>/<module_id>.kpm, with an optional
+ * kpm/<module_id>/disable marker.
+ */
+struct ap_kpm_scan_ctx {
+    struct dir_context dctx;
+    char *names;
+    int count;
+};
+
+struct ap_kpm_scan_ctx_int {
+    struct dir_context_int dctx;
+    char *names;
+    int count;
+};
+
+static int ap_kpm_valid_name(const char *name, int namelen)
+{
+    if (!name || namelen <= 0 || namelen >= AP_KPM_NAME_LEN) return 0;
+    if ((namelen == 1 && name[0] == '.') || (namelen == 2 && name[0] == '.' && name[1] == '.')) return 0;
+    for (int i = 0; i < namelen; i++) {
+        if (name[i] == '/' || name[i] == '\\') return 0;
+    }
+    return 1;
+}
+
+static bool ap_kpm_scan_actor(struct dir_context *dctx, const char *name, int namelen,
+                              loff_t offset, u64 ino, unsigned int d_type)
+{
+    struct ap_kpm_scan_ctx *ctx = container_of(dctx, struct ap_kpm_scan_ctx, dctx);
+    if (!ctx || ctx->count >= AP_KPM_MAX_MODULES || !ap_kpm_valid_name(name, namelen)) return true;
+    char *slot = ctx->names + ctx->count * AP_KPM_NAME_LEN;
+    memcpy(slot, name, namelen);
+    slot[namelen] = '\0';
+    ctx->count++;
+    return true;
+}
+
+static int ap_kpm_scan_actor_int(struct dir_context_int *dctx, const char *name, int namelen,
+                                 loff_t offset, u64 ino, unsigned int d_type)
+{
+    struct ap_kpm_scan_ctx_int *ctx = container_of(dctx, struct ap_kpm_scan_ctx_int, dctx);
+    if (!ctx || ctx->count >= AP_KPM_MAX_MODULES || !ap_kpm_valid_name(name, namelen)) return 0;
+    char *slot = ctx->names + ctx->count * AP_KPM_NAME_LEN;
+    memcpy(slot, name, namelen);
+    slot[namelen] = '\0';
+    ctx->count++;
+    return 0;
+}
+
+int load_ap_kpm_modules(void)
+{
+    struct file *dir;
+    char *names;
+    int count = 0, loaded = 0, skipped = 0;
+    int rc;
+
+    if (android_is_safe_mode) return 0;
+    names = vmalloc((size_t)AP_KPM_MAX_MODULES * AP_KPM_NAME_LEN);
+    if (!names) return -ENOMEM;
+    memset(names, 0, (size_t)AP_KPM_MAX_MODULES * AP_KPM_NAME_LEN);
+
+    set_priv_sel_allow(current, true);
+    dir = filp_open(AP_KPM_DIR, O_RDONLY | O_NOFOLLOW, 0);
+    if (!dir || IS_ERR(dir)) {
+        rc = dir ? PTR_ERR(dir) : -ENOENT;
+        set_priv_sel_allow(current, false);
+        kvfree(names);
+        if (rc != -ENOENT) log_boot("open AP KPM directory failed: %d\n", rc);
+        return rc == -ENOENT ? 0 : rc;
+    }
+
+    if (kver >= VERSION(6, 1, 0)) {
+        struct ap_kpm_scan_ctx ctx = { .names = names };
+        ctx.dctx.actor = ap_kpm_scan_actor;
+        ctx.dctx.pos = 0;
+        iterate_dir(dir, &ctx.dctx);
+        count = ctx.count;
+    } else {
+        struct ap_kpm_scan_ctx_int ctx = { .names = names };
+        ctx.dctx.actor = ap_kpm_scan_actor_int;
+        ctx.dctx.pos = 0;
+        iterate_dir_int(dir, &ctx.dctx);
+        count = ctx.count;
+    }
+    filp_close(dir, 0);
+    set_priv_sel_allow(current, false);
+
+    for (int i = 0; i < count; i++) {
+        char *id = names + i * AP_KPM_NAME_LEN;
+        char path[AP_KPM_NAME_LEN * 2 + sizeof(AP_KPM_DIR) + 8];
+        char disable[AP_KPM_NAME_LEN + sizeof(AP_KPM_DIR) + 16];
+        int path_len = snprintf(path, sizeof(path), AP_KPM_DIR "%s/%s.kpm", id, id);
+        int disable_len = snprintf(disable, sizeof(disable), AP_KPM_DIR "%s/disable", id);
+        struct file *marker;
+
+        if (path_len <= 0 || path_len >= sizeof(path) || disable_len <= 0 || disable_len >= sizeof(disable)) {
+            skipped++;
+            continue;
+        }
+        set_priv_sel_allow(current, true);
+        marker = filp_open(disable, O_RDONLY | O_NOFOLLOW, 0);
+        if (marker && !IS_ERR(marker)) {
+            filp_close(marker, 0);
+            set_priv_sel_allow(current, false);
+            log_boot("skip disabled AP KPM: %s\n", id);
+            skipped++;
+            continue;
+        }
+        set_priv_sel_allow(current, false);
+
+        rc = load_module_path_event(path, 0, EXTRA_EVENT_POST_FS_DATA, 0);
+        log_boot("load AP KPM: %s, event: %s, rc: %d\n", path, EXTRA_EVENT_POST_FS_DATA, rc);
+        if (!rc) loaded++;
+    }
+
+    kvfree(names);
+    log_boot("AP KPM loading done: loaded=%d skipped=%d total=%d\n", loaded, skipped, count);
+    return loaded;
+}
+KP_EXPORT_SYMBOL(load_ap_kpm_modules);
+
 static void pre_user_exec_init()
 {
     extra_event_init(EXTRA_EVENT_PRE_EXEC_INIT);
@@ -1363,7 +1559,10 @@ static void post_init_second_stage()
 
 static void on_first_app_process()
 {
-    refresh_trusted_manager_state();
+    /* Refresh the trusted-manager state (APK scan) synchronously here.  The scan
+     * itself is two-phase so it cannot deadlock on the /data/app inode lock. */
+    int rc = refresh_trusted_manager_state();
+    log_boot("on_first_app_process: trusted manager refresh rc=%d\n", rc);
 }
 
 static void handle_before_execve(hook_local_t *hook_local, char **__user u_filename_p, char **__user uargv,
@@ -1380,6 +1579,8 @@ static void handle_before_execve(hook_local_t *hook_local, char **__user u_filen
     } else {
         hook_local->data0 = 0;
     }
+
+    if (current_uid() != 0 && !hook_local->data0) return;
 
     static char app_process[] = "/system/bin/app_process";
     static char app_process64[] = "/system/bin/app_process64";
@@ -1530,12 +1731,14 @@ static void before_openat(hook_fargs4_t *args, void *udata)
     args->local.data3 = 0;
     static int replaced = 0;
 
+    if (replaced) return;
+
+    if (current_uid() != 0) return;
+
     const char __user *filename = (typeof(filename))syscall_argn(args, 1);
     char buf[256];
     long rc = compat_strncpy_from_user(buf, filename, sizeof(buf));
     if (rc <= 0) return;
-
-    if (replaced) return;
 
     int file_count = sizeof(ORIGIN_RC_FILES) / sizeof(ORIGIN_RC_FILES[0]);
     for (int i = 0; i < file_count; i++) {
@@ -1573,10 +1776,14 @@ static void before_openat(hook_fargs4_t *args, void *udata)
 
     char added_rc_data[4096];
     const char *sk = get_superkey();
-    sprintf(added_rc_data, user_rc_data, sk, sk, sk, sk, sk, sk, sk);
+    int added_rc_len = expand_rc_template(added_rc_data, sizeof(added_rc_data), user_rc_data, sk);
+    if (added_rc_len < 0) {
+        log_boot("expand rc template error: %d\n", added_rc_len);
+        goto free;
+    }
 
-    kernel_write(newfp, added_rc_data, strlen(added_rc_data), &off);
-    if (off != strlen(added_rc_data) + ori_len) {
+    kernel_write(newfp, added_rc_data, added_rc_len, &off);
+    if (off != added_rc_len + ori_len) {
         log_boot("write replace rc error: %x\n", off);
         goto free;
     }

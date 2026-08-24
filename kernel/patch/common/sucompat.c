@@ -34,10 +34,13 @@
 #include <kconfig.h>
 #include <linux/vmalloc.h>
 #include <sucompat.h>
+#include <userd.h>
 #include <symbol.h>
+#include <kallsyms.h>
 #include <uapi/linux/limits.h>
 #include <predata.h>
 #include <kstorage.h>
+#include <selinux_hide.h>
 
 const char sh_path[] = SH_PATH;
 const char default_su_path[] = SU_PATH;
@@ -45,12 +48,43 @@ const char default_su_path[] = SU_PATH;
 #ifdef ANDROID
 const char legacy_su_path[] = LEGACY_SU_PATH;
 const char apd_path[] = APD_PATH;
+extern int android_is_safe_mode;
 #endif
-
+const char sucompat_file[] = "/data/adb/ap/sucompat";
 static const char *current_su_path = 0;
 
 static int su_kstorage_gid = -1;
 static int exclude_kstorage_gid = -1;
+static void su_register_path_probe_hooks(void);
+static void su_unregister_path_probe_hooks(void);
+long kp_control_feature_sc(const char __user *uname, int state)
+{
+    char name[64];
+    int len = compat_strncpy_from_user(name, uname, sizeof(name));
+    if (len <= 0)
+        return -EINVAL;
+
+    if (!strcmp(name, "selinux_hide")) {
+        return selinux_hide_control(state);
+    }
+
+    if (!strcmp(name, "sucompat_extra") || !strcmp(name, "path_probe")) {
+        if (state < 0)
+            /* Query: check if the hooks are currently registered. */
+            return 0;   /* not tracked */
+        if (state)
+            su_register_path_probe_hooks();
+        else
+            su_unregister_path_probe_hooks();
+        logkfi("sucompat_extra %s via supercall\n",
+               state ? "enabled" : "disabled");
+        return 0;
+    }
+
+    /* Unknown feature name. */
+    return -ENOENT;
+}
+KP_EXPORT_SYMBOL(kp_control_feature_sc);
 
 int is_su_allow_uid(uid_t uid)
 {
@@ -198,7 +232,28 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
     int flen = compat_strncpy_from_user(filename, ufilename, sizeof(filename));
     if (flen <= 0) return;
 
-    if (!strcmp(current_su_path, filename)) {
+#ifdef ANDROID
+    // Match the configured su path (default /system/bin/kp) and the legacy
+    // /system/bin/su that shells and detectors also exec. execve does not go
+    // through getname_flags, so this before-hook is the only place to redirect
+    // a real exec of /system/bin/su to sh/apd.
+    if (strcmp(filename, current_su_path) && strcmp(filename, legacy_su_path)) {
+        if (!strcmp(SUPERCMD, filename)) {
+            void handle_supercmd(char **__user u_filename_p, char **__user uargv);
+            handle_supercmd(u_filename_p, uargv);
+        }
+        return;
+    }
+#else
+    if (strcmp(filename, current_su_path)) {
+        if (!strcmp(SUPERCMD, filename)) {
+            void handle_supercmd(char **__user u_filename_p, char **__user uargv);
+            handle_supercmd(u_filename_p, uargv);
+        }
+        return;
+    }
+#endif
+    {
         uid_t uid = current_uid();
         struct su_profile profile = { .to_uid = 0 };
         if (is_trusted_manager_uid(uid)) {
@@ -255,10 +310,6 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
             logkfi("call apd uid: %d, to_uid: %d, sctx: %s, cplen: %d, %d\n", uid, to_uid, sctx, cplen, argv_cplen);
         }
 #endif // ANDROID
-    } else if (!strcmp(SUPERCMD, filename)) {
-        void handle_supercmd(char **__user u_filename_p, char **__user uargv);
-        handle_supercmd(u_filename_p, uargv);
-        return;
     }
 }
 
@@ -310,7 +361,7 @@ __maybe_unused static void before_execveat(hook_fargs5_t *args, void *udata)
 // 		int, dfd, const char __user *, filename, unsigned, flags,
 // 		unsigned int, mask,
 // 		struct statx __user *, buffer)
-static void su_handler_arg1_ufilename_before(hook_fargs6_t *args, void *udata)
+__maybe_unused static void su_handler_arg1_ufilename_before(hook_fargs6_t *args, void *udata)
 {
     uid_t uid = current_uid();
     if (!is_su_allow_uid(uid) && !is_trusted_manager_uid(uid)) return;
@@ -321,13 +372,85 @@ static void su_handler_arg1_ufilename_before(hook_fargs6_t *args, void *udata)
     int flen = compat_strncpy_from_user(filename, *u_filename_p, sizeof(filename));
     if (flen <= 0) return;
 
-    if (!strcmp(current_su_path, filename)) {
+#ifdef ANDROID
+    if (strcmp(filename, current_su_path) && strcmp(filename, legacy_su_path)) return;
+#else
+    if (strcmp(filename, current_su_path)) return;
+#endif
+    {
         void *uptr = copy_to_user_stack(sh_path, sizeof(sh_path));
         if (uptr && !IS_ERR(uptr)) {
             *u_filename_p = uptr;
         } else {
             logkfi("su uid: %d, cp stack error: %d\n", uid, uptr);
         }
+    }
+}
+
+static void after_getname_flags(hook_fargs3_t *args, void *udata)
+{
+    struct filename *fn = (struct filename *)args->ret;
+    if (IS_ERR_OR_NULL(fn)) return;
+
+    uid_t uid = current_uid();
+    if (!is_su_allow_uid(uid) && !is_trusted_manager_uid(uid)) return;
+
+    const char *name = fn->name;
+    if (!name || strcmp(name, su_get_path())) return;
+
+    if (strlen(sh_path) <= strlen(name)) {
+        strcpy((char *)name, sh_path);
+        return;
+    }
+
+    if (kfunc(getname_kernel) && kfunc(putname)) {
+        struct filename *nf = kfunc(getname_kernel)(sh_path);
+        if (!IS_ERR_OR_NULL(nf)) {
+            kfunc(putname)(fn);
+            args->ret = (uint64_t)nf;
+            return;
+        }
+    }
+
+    logkfi("uid: %d, cannot redirect su path to %s\n", uid, sh_path);
+}
+
+// stat-class probes on a real third-party su binary: security_inode_getattr fires
+// because the file genuinely exists. Show it only to granted uids (return 0, same
+// as the virtual su path which getname_flags redirects to sh for them) and hide
+// it from everyone else by failing the getattr (-ENOENT), which makes vfs_getattr
+// report ENOENT and the probe sees no su. struct path is { mnt; dentry; }.
+typedef char *(*su_dentry_path_raw_t)(void *dentry, char *buf, int buflen);
+static su_dentry_path_raw_t su_dentry_path_raw = 0;
+
+static void after_security_inode_getattr(hook_fargs1_t *args, void *udata)
+{
+    if ((long)args->ret < 0) return; // already an error, nothing to do
+
+    uid_t uid = current_uid();
+    bool granted = is_su_allow_uid(uid) || is_trusted_manager_uid(uid);
+
+    void *path = (void *)args->arg0;
+    if (!path) return;
+    void *dentry = *(void **)((char *)path + 8); // path->dentry
+    if (!dentry || !su_dentry_path_raw) return;
+
+    char buf[PATH_MAX];
+    char *p = su_dentry_path_raw(dentry, buf, sizeof(buf));
+    if (!p || !p[0]) return;
+
+#ifdef ANDROID
+    if (strcmp(p, su_get_path()) && strcmp(p, legacy_su_path)) return;
+#else
+    if (strcmp(p, su_get_path())) return;
+#endif
+
+    // Hide the real su file from unprivileged callers; keep it visible to granted ones.
+    if (!granted) {
+        args->ret = (uint64_t)-ENOENT;
+        logkfi("uid: %d, hide real su file: %s\n", uid, p);
+    } else {
+        logkfi("uid: %d, show real su file: %s\n", uid, p);
     }
 }
 
@@ -394,23 +517,84 @@ int su_compat_init()
     rc = hook_syscalln(__NR_execve, 3, before_execve, 0, (void *)0);
     log_boot("hook __NR_execve rc: %d\n", rc);
 
+    /* Android init may execute commands through execveat().  Keep the
+     * SUPERCMD/su redirection on both entry points; otherwise /system/bin/
+     * truncate is executed literally and every apd bootstrap command exits
+     * with status 1. */
+    rc = hook_syscalln(__NR_execveat, 5, before_execveat, 0, (void *)0);
+    log_boot("hook __NR_execveat rc: %d\n", rc);
+
+    // __NR_execve 11
+    rc = hook_compat_syscalln(11, 3, before_execve, 0, (void *)1);
+    log_boot("hook 32 __NR_execve rc: %d\n", rc);
+
+    // __NR_execveat 387 on arm64 compat
+    rc = hook_compat_syscalln(387, 5, before_execveat, 0, (void *)1);
+    log_boot("hook 32 __NR_execveat rc: %d\n", rc);
+
+    // Redirect the su path only for granted uids: after_getname_flags checks
+    // is_su_allow_uid/is_trusted_manager_uid, so a granted app's stat/access on
+    // /system/bin/su or /system/bin/kp lands on the real /system/bin/sh and the
+    // probe reports it present, while unprivileged callers keep the virtual su
+    // path un-redirected and get ENOENT (hidden).
+    //
+    // LTO kernels (e.g. OPPO 6.1) emit getname_flags as a CFI wrapper with zero
+    // callers; the real entry all path syscalls reach is __original_getname_flags.
+    // Prefer it, fall back to getname_flags for non-LTO builds.
+    unsigned long getname_flags_addr = 0;
+    getname_flags_addr = kallsyms_lookup_name("__original_getname_flags");
+    if (!getname_flags_addr) {
+        getname_flags_addr = kallsyms_lookup_name("getname_flags");
+    }else{
+        logkfi("found __original_getname_flags: %llx\n", getname_flags_addr);
+    }
+    if (getname_flags_addr) {
+        rc = hook_wrap3((void *)getname_flags_addr, 0, after_getname_flags, (void *)0);
+        log_boot("hook getname_flags rc: %d\n", rc);
+    } else {
+        log_boot("getname_flags not found\n");
+    }
+
+
+    return 0;
+}
+
+static void su_register_path_probe_hooks(void)
+{
+    #ifdef ANDROID
+        if (unlikely(android_is_safe_mode)) return;
+    #endif
+    hook_err_t rc;
+
     rc = hook_syscalln(__NR3264_fstatat, 4, su_handler_arg1_ufilename_before, 0, (void *)0);
     log_boot("hook __NR3264_fstatat rc: %d\n", rc);
 
     rc = hook_syscalln(__NR_faccessat, 3, su_handler_arg1_ufilename_before, 0, (void *)0);
     log_boot("hook __NR_faccessat rc: %d\n", rc);
 
-    // __NR_execve 11
-    rc = hook_compat_syscalln(11, 3, before_execve, 0, (void *)1);
-    log_boot("hook 32 __NR_execve rc: %d\n", rc);
-
-    // __NR_fstatat64 327
+    /* 32-bit compat probes: fstatat64(327) / faccessat(334) */
     rc = hook_compat_syscalln(327, 4, su_handler_arg1_ufilename_before, 0, (void *)0);
     log_boot("hook 32 __NR_fstatat64 rc: %d\n", rc);
 
-    //  __NR_faccessat 334
     rc = hook_compat_syscalln(334, 3, su_handler_arg1_ufilename_before, 0, (void *)0);
     log_boot("hook 32 __NR_faccessat rc: %d\n", rc);
+}
 
-    return 0;
+static void su_unregister_path_probe_hooks(void)
+{
+    unhook_syscalln(__NR3264_fstatat, su_handler_arg1_ufilename_before, 0);
+    unhook_syscalln(__NR_faccessat, su_handler_arg1_ufilename_before, 0);
+    unhook_compat_syscalln(327, su_handler_arg1_ufilename_before, 0);
+    unhook_compat_syscalln(334, su_handler_arg1_ufilename_before, 0);
+}
+
+void sucompat_init()
+{
+    struct file *file = filp_open(sucompat_file, O_RDONLY, 0);
+    if (IS_ERR(file)) {
+        log_boot("failed to open sucompat file: %ld\n", PTR_ERR(file));
+        return;
+    }
+    filp_close(file, NULL);
+    su_register_path_probe_hooks(); 
 }
